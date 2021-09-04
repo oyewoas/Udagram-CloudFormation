@@ -1,0 +1,275 @@
+Description: >
+    Ayooluwa Oyewo / Udacity Udagram CloudFormation Server
+    - Launch Configuration and Group
+    - Application Load Balancer
+    - Jump Box Server
+    - IAM Role
+    - Security Group
+
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names.
+        Type: String
+
+    WebServerPort:
+      Description: The web server port.
+      Type: String
+      Default: 80
+
+    AMItoUse:
+      Description: Ubuntu 18 AMI to use for our base image.
+      Type: String
+      Default: ami-00ddb0e5626798373
+
+    WebServerInstanceType:
+      Description: The web server instance type.
+      Type: String
+      Default: t3.medium
+
+    JumpBoxServerAMI:
+      Description: The AMI used to deploy the Jump box.
+      Type: String
+      Default: ami-00ddb0e5626798373
+
+    JumpBoxServerInstanceType:
+      Description: The web server instance type used by the Jump box.
+      Type: String
+      Default: t3.micro
+
+    JumpBoxServerKey:
+      Description: The Key to deploy in the Jump box server
+      Type: String
+      Default: jumbpox-key
+
+    PersonalIP:
+      Description: Personal IP to access the Jump box server
+      Type: String
+      Default: 190.822.56.45/32
+
+Resources:
+  # IAM Role to allow EC2 Session Manager to access our server
+  RoleForSSMAccess: 
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: WebServersS3ReadRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement: 
+              - 
+                Effect: "Allow"
+                Action: 
+                  - S3:List*
+                  - S3:Get*
+                Resource: "*"
+
+  # Instance Profile
+  ServerInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Roles: 
+        - !Ref RoleForSSMAccess
+
+  JumpBoxServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref PersonalIP
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+      
+  JumpBoxServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      SecurityGroupIds:
+        - !Ref JumpBoxServerSecurityGroup
+      KeyName: !Ref JumpBoxServerKey
+      ImageId: !Ref JumpBoxServerAMI
+      InstanceType: !Ref JumpBoxServerInstanceType
+      SubnetId: 
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-PUB1-SN"
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+     
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref WebServerPort
+          ToPort: !Ref WebServerPort
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref WebServerPort
+          ToPort: !Ref WebServerPort
+          CidrIp: 0.0.0.0/0
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref WebServerPort
+          ToPort: !Ref WebServerPort
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  # Autoscaling with Launch Config
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install unzip awscli -y
+          apt-get install apache2 -y
+          systemctl start apache2.service
+          cd /var/www/html
+          aws s3 cp s3://288293940374-udagram-project/udagram-app.zip .
+          unzip -o udagram-app.zip
+      ImageId: !Ref AMItoUse
+      IamInstanceProfile: !Ref ServerInstanceProfile
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: !Ref WebServerInstanceType
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+  # Autoscaling Group With Launch Config  
+  WebAppAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: '4'
+      MaxSize: '8'
+      TargetGroupARNs:
+        - Ref: WebAppTargetGroup
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+#  Load Balancer
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  LBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: !Ref WebServerPort
+      Protocol: HTTP
+
+  LBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref LBListener
+        Priority: 1
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: !Ref WebServerPort
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+      Tags: 
+        - Key: Name
+          Value: !Ref EnvironmentName
+Outputs: 
+
+    LBPublicUrl: 
+      Description: A reference to public URL of the Load Balancer
+      Value: !Sub 
+        - http://${LB_PUB_URL}
+        - { LB_PUB_URL: !GetAtt WebAppLB.DNSName}
+      Export:
+        Name: !Sub ${EnvironmentName}-LB-PUB-URL
+
+    LoadBalancer:
+      Description: A reference to the Application Load Balancer
+      Value: !Ref WebAppLB
+      Export:
+        Name: !Sub ${EnvironmentName}-LB
+
+    LBListener:
+      Description: A reference to a port 80 Load Balancer listener
+      Value: !Ref LBListener
+      Export:
+        Name: !Sub ${EnvironmentName}-LB-LISTENER
+
+    JumpBoxServerPubDnsName:
+      Description: The Public DNS of the Jump Box Server
+      Value: !GetAtt JumpBoxServer.PublicDnsName
+      Export:
+        Name: !Sub ${EnvironmentName}-JUMP-BOX-SERVER-PUB-DNS
